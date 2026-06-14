@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Moxfield Tagger",
+  "version": "0.1.0",
+  "description": "Tagging tools for Moxfield deck pages.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "moxfield-tagger@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "icons": {
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
+  "action": {
+    "default_icon": {
+      "32": "icon-32.png",
+      "48": "icon-48.png"
+    },
+    "default_title": "Moxfield Tagger",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://moxfield.com/*", "https://www.moxfield.com/*"],
+      "js": ["scryfall.js", "content.js"]
+    }
+  ]
+}
