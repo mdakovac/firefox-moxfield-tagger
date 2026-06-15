@@ -126,8 +126,8 @@
     return accessToken.token;
   }
 
-  async function fetchDeck(publicId) {
-    if (state.decks.has(publicId)) return state.decks.get(publicId);
+  async function fetchDeck(publicId, { force = false } = {}) {
+    if (!force && state.decks.has(publicId)) return state.decks.get(publicId);
     const res = await fetch(`${API}/v3/decks/all/${publicId}`, {
       credentials: "include",
     });
@@ -137,8 +137,23 @@
     }
     const deck = toPlain(await res.json());
     state.decks.set(publicId, deck);
-    log("deck loaded:", publicId, deck?.name ?? "");
+    log(force ? "deck refreshed:" : "deck loaded:", publicId, deck?.name ?? "");
     return deck;
+  }
+
+  async function refreshDeckState(publicId) {
+    const deck = await fetchDeck(publicId, { force: true });
+    if (!deck) return false;
+
+    const scryfallTagsById = new Map(state.cards.map((c) => [c.scryfallId, c.scryfallTags]));
+    const cards = collectCards(deck);
+    for (const card of cards) {
+      card.scryfallTags = (scryfallTagsById.get(card.scryfallId) ?? []).map(String);
+    }
+    state.cards = cards;
+    initWriteState(deck);
+    log("deck state refreshed for apply, version", state.write.version);
+    return true;
   }
 
   // ---- lifecycle ----
@@ -313,13 +328,18 @@
     state.applying = true;
     const summary = { updated: 0, skipped: 0, failed: 0 };
     try {
-      const deck = state.decks.get(state.initializedFor);
-      if (!deck || !state.cards.length || !state.write) {
+      const publicId = state.initializedFor;
+      if (!publicId) {
         return { ...summary, error: "no initialized deck" };
       }
       const selected = new Set(selectedList.map(String));
       const token = await getAccessToken();
-      await syncWriteState();
+      if (!(await refreshDeckState(publicId))) {
+        return { ...summary, error: "could not refresh deck" };
+      }
+      if (!state.cards.length || !state.write) {
+        return { ...summary, error: "no initialized deck" };
+      }
 
       for (const card of state.cards) {
         const existing = (state.write.authorTags[card.name] ?? []).map(String);
