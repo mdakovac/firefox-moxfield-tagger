@@ -5,6 +5,7 @@
 
   const headerEl = document.getElementById("header");
   const applyEl = document.getElementById("apply");
+  const selectedTagsEl = document.getElementById("selected-tags");
   const deckNameEl = document.getElementById("deck-name");
   const searchEl = document.getElementById("search");
   const tagsEl = document.getElementById("tags");
@@ -30,6 +31,35 @@
   function syncApplyButton(applying) {
     applyEl.disabled = applying;
     applyEl.textContent = applying ? "Applying…" : "Apply Tags";
+  }
+
+  function renderSelectedTags(selected, tagCounts, checkboxes, syncSelected) {
+    const tags = tagCounts.map(([tag]) => tag).filter((tag) => selected.has(tag));
+    selectedTagsEl.replaceChildren(
+      ...tags.map((tag) => {
+        const chip = document.createElement("span");
+        chip.className = "selected-tag";
+
+        const name = document.createElement("span");
+        name.className = "selected-tag-name";
+        name.textContent = tag;
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "selected-tag-remove";
+        remove.setAttribute("aria-label", `Remove ${tag}`);
+        remove.textContent = "×";
+        remove.addEventListener("click", () => {
+          selected.delete(tag);
+          const checkbox = checkboxes.get(tag);
+          if (checkbox) checkbox.checked = false;
+          syncSelected();
+        });
+
+        chip.append(name, remove);
+        return chip;
+      })
+    );
   }
 
   function watchApplying() {
@@ -58,6 +88,12 @@
   function render(state) {
     deckNameEl.textContent = state.deckName || "Moxfield Tagger";
     const selected = new Set(state.selected);
+    const checkboxes = new Map();
+
+    function syncSelected() {
+      renderSelectedTags(selected, state.tagCounts, checkboxes, syncSelected);
+      browser.tabs.sendMessage(tabId, { type: "setSelectedTags", selected: [...selected] });
+    }
 
     tagsEl.replaceChildren(
       ...state.tagCounts.map(([tag, count]) => {
@@ -67,10 +103,11 @@
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.checked = selected.has(tag);
+        checkboxes.set(tag, checkbox);
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) selected.add(tag);
           else selected.delete(tag);
-          browser.tabs.sendMessage(tabId, { type: "setSelectedTags", selected: [...selected] });
+          syncSelected();
         });
 
         const name = document.createElement("span");
@@ -114,6 +151,8 @@
         label.classList.toggle("hidden", !label.dataset.tag.includes(query));
       }
     });
+
+    renderSelectedTags(selected, state.tagCounts, checkboxes, syncSelected);
 
     statusEl.classList.add("hidden");
     headerEl.classList.remove("hidden");

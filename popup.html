@@ -33,6 +33,55 @@
         background: transparent;
         color: inherit;
       }
+      #selected-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        min-height: 0;
+        margin-bottom: 8px;
+      }
+      #selected-tags:empty {
+        display: none;
+      }
+      #selected-tags .selected-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        max-width: 100%;
+        padding: 2px 4px 2px 7px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1.3;
+        background: color-mix(in srgb, #e84e1c 18%, transparent);
+        color: inherit;
+      }
+      #selected-tags .selected-tag-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #selected-tags .selected-tag-remove {
+        display: flex;
+        flex-shrink: 0;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        padding: 0;
+        border: none;
+        border-radius: 999px;
+        font: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        background: transparent;
+        color: inherit;
+        opacity: 0.65;
+      }
+      #selected-tags .selected-tag-remove:hover {
+        opacity: 1;
+        background: color-mix(in srgb, currentColor 15%, transparent);
+      }
       #apply {
         box-sizing: border-box;
         width: 100%;
@@ -105,6 +154,7 @@
   <body>
     <header class="hidden" id="header">
       <h1 id="deck-name">Moxfield Tagger</h1>
+      <div id="selected-tags" aria-label="Selected tags"></div>
       <button id="apply">Apply Tags</button>
       <input id="search" type="search" placeholder="Search tags…" autofocus />
     </header>
