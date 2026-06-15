@@ -20,6 +20,7 @@
 
   let tabId = null;
   let applyingPoll = null;
+  let getSelectedCount = () => 0;
 
   function stopApplyingPoll() {
     if (applyingPoll !== null) {
@@ -29,7 +30,7 @@
   }
 
   function syncApplyButton(applying) {
-    applyEl.disabled = applying;
+    applyEl.disabled = applying || getSelectedCount() === 0;
     applyEl.textContent = applying ? "Applying…" : "Apply Tags";
   }
 
@@ -89,9 +90,11 @@
     deckNameEl.textContent = state.deckName || "Moxfield Tagger";
     const selected = new Set(state.selected);
     const checkboxes = new Map();
+    getSelectedCount = () => selected.size;
 
     function syncSelected() {
       renderSelectedTags(selected, state.tagCounts, checkboxes, syncSelected);
+      syncApplyButton(false);
       browser.tabs.sendMessage(tabId, { type: "setSelectedTags", selected: [...selected] });
     }
 
@@ -124,6 +127,7 @@
     );
 
     applyEl.addEventListener("click", async () => {
+      if (selected.size === 0) return;
       syncApplyButton(true);
       let resultText;
       try {
