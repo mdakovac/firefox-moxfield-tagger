@@ -1,14 +1,6 @@
 # Moxfield Tagger
 
-Firefox extension that activates on Moxfield deck pages (`https://moxfield.com/decks/<id>`), but only when you're logged in.
-
-## How it works
-
-- `content.js` runs on all moxfield.com pages and calls the Moxfield API itself, with the page's cookies (`credentials: "include"`):
-  - `POST https://api2.moxfield.com/v1/startup/authenticated` → a 2xx response means we're logged in (checked once per page load).
-  - `GET https://api2.moxfield.com/v3/decks/all/<publicId>` → the full deck JSON (cached per deck).
-- Moxfield is a SPA, so the script polls the URL to detect route changes between decks.
-- Once we're on a deck page, logged in, and have the deck data, `initialize()` fires (currently just logs to the console).
+Firefox extension that activates on Moxfield deck pages (`https://moxfield.com/decks/<id>`) and enables automatic tagging of cards using scryfall tags system.
 
 ## Load it in Firefox (temporary, for development)
 
