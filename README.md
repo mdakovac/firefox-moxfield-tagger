@@ -1,6 +1,6 @@
 # Moxfield Tagger
 
-Firefox extension that activates on Moxfield deck pages (`https://moxfield.com/decks/<id>`) and enables automatic tagging of cards using scryfall tags system.
+Firefox extension that enables automatic tagging of cards using scryfall tags system on Moxfield deck pages.
 
 ## Load it in Firefox (temporary, for development)
 
