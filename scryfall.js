@@ -43,6 +43,39 @@ const ScryfallTags = (() => {
   const cacheGet = (key) => dbRequest("readonly", (store) => store.get(key));
   const cachePut = (key, value) => dbRequest("readwrite", (store) => store.put(value, key));
 
+  // ---- gzipped JSONL reader ----
+  // Bulk files are newline-delimited JSON served as application/gzip with no
+  // Content-Encoding header, so the browser hands us the raw gzip bytes and we
+  // have to inflate them ourselves. Streaming avoids materialising the whole
+  // ~18 MB of decompressed text as one string.
+  async function fetchJsonl(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`bulk file download failed (${res.status})`);
+    const reader = res.body
+      .pipeThrough(new DecompressionStream("gzip"))
+      .pipeThrough(new TextDecoderStream())
+      .getReader();
+
+    const records = [];
+    let buffer = "";
+    const flush = (upTo) => {
+      for (const line of buffer.slice(0, upTo).split("\n")) {
+        if (line.trim()) records.push(JSON.parse(line));
+      }
+      buffer = buffer.slice(upTo);
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += value;
+      // Only parse up to the last complete line; keep the partial tail.
+      const lastNewline = buffer.lastIndexOf("\n");
+      if (lastNewline !== -1) flush(lastNewline + 1);
+    }
+    flush(buffer.length);
+    return records;
+  }
+
   // ---- oracle_id -> [tag labels] index ----
   let indexPromise = null; // memoized per page load
 
@@ -73,10 +106,8 @@ const ScryfallTags = (() => {
       return index;
     }
 
-    log(`downloading oracle tags bulk file (${(meta.size / 1e6).toFixed(1)} MB)…`);
-    const res = await fetch(meta.download_uri);
-    if (!res.ok) throw new Error(`bulk file download failed (${res.status})`);
-    const tags = await res.json();
+    log(`downloading oracle tags bulk file (${(meta.compressed_size / 1e6).toFixed(1)} MB gzipped)…`);
+    const tags = await fetchJsonl(meta.jsonl_download_uri);
 
     // A tagging implies the tag itself plus all its ancestors in the tag
     // hierarchy (Tagger shows these as "inherited" tags), so expand each tag
