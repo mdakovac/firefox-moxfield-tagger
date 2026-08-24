@@ -8,59 +8,87 @@ const ScryfallTags = (() => {
   "use strict";
 
   const SCRYFALL_API = "https://api.scryfall.com";
-  const DB_NAME = "moxfield-tagger";
-  const DB_STORE = "scryfall";
   // Bump the suffix when the index format changes so stale caches are rebuilt.
-  const INDEX_KEY = "oracleTagIndex@3";
+  const INDEX_KEY = "oracleTagIndex@4";
+  // Scryfall's API guidelines ask for 50-100ms between requests; enforced for
+  // every API-host call by apiFetch below.
+  const REQUEST_SPACING_MS = 100;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function log(...args) {
     console.log("[moxfield-tagger:scryfall]", ...args);
   }
 
-  // ---- IndexedDB cache (so the ~17 MB bulk file is downloaded once a day) ----
-  function openDb() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, 1);
-      req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+  // ---- request scheduler ----
+  // Every api.scryfall.com request goes through here, so the spacing holds no
+  // matter how the callers are composed: getTags() deliberately runs the index
+  // load and the id resolution concurrently, which would otherwise put the
+  // bulk-metadata GET and the first /cards/collection POST on the wire at the
+  // same instant. Requests are issued one at a time, REQUEST_SPACING_MS apart.
+  //
+  // The bulk file itself is not routed through here: it is served from a
+  // separate CDN host, not the rate-limited API host, and serialising a ~17 MB
+  // download behind this queue would stall every other request.
+  let apiQueue = Promise.resolve();
+  let lastRequestAt = 0;
+
+  function apiFetch(path, init) {
+    const result = apiQueue.then(async () => {
+      const wait = REQUEST_SPACING_MS - (Date.now() - lastRequestAt);
+      if (wait > 0) await sleep(wait);
+      lastRequestAt = Date.now();
+      return fetch(`${SCRYFALL_API}${path}`, init);
     });
+    // Keep the queue moving when a request fails; the caller still sees it.
+    apiQueue = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
   }
 
-  async function dbRequest(mode, run) {
-    const db = await openDb();
-    try {
-      return await new Promise((resolve, reject) => {
-        const req = run(db.transaction(DB_STORE, mode).objectStore(DB_STORE));
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-      });
-    } finally {
-      db.close();
-    }
+  // ---- cache (so the ~17 MB bulk file is downloaded once a day) ----
+  // Deliberately browser.storage.local rather than indexedDB: a content
+  // script's indexedDB belongs to the *page's* origin, so the index would live
+  // in moxfield.com's storage bucket, where page scripts could read it, rewrite
+  // it (and so choose the tags we write back onto the user's decks), or push
+  // the site over its quota.
+  async function cacheGet(key) {
+    const stored = await browser.storage.local.get(key);
+    return stored?.[key] ?? null;
   }
 
-  const cacheGet = (key) => dbRequest("readonly", (store) => store.get(key));
-  const cachePut = (key, value) => dbRequest("readwrite", (store) => store.put(value, key));
+  const cachePut = (key, value) => browser.storage.local.set({ [key]: value });
+
+  // Versions before 0.2.0 cached into page-origin indexedDB. Drop that copy so
+  // the stale ~17 MB isn't left sitting in moxfield.com's quota. No-op once gone.
+  try {
+    indexedDB.deleteDatabase("moxfield-tagger");
+  } catch (err) {
+    log("could not remove legacy page-origin cache:", err);
+  }
 
   // ---- gzipped JSONL reader ----
   // Bulk files are newline-delimited JSON served as application/gzip with no
   // Content-Encoding header, so the browser hands us the raw gzip bytes and we
-  // have to inflate them ourselves. Streaming avoids materialising the whole
-  // ~18 MB of decompressed text as one string.
-  async function fetchJsonl(url) {
+  // have to inflate them ourselves. Records are handed to the caller one at a
+  // time and never collected here: the decompressed file is ~18 MB of text and
+  // several times that once parsed into objects, and this all runs inside the
+  // page's content process.
+  async function streamJsonl(url, onRecord) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`bulk file download failed (${res.status})`);
+    if (!res.body) throw new Error("bulk file response had no body");
     const reader = res.body
       .pipeThrough(new DecompressionStream("gzip"))
       .pipeThrough(new TextDecoderStream())
       .getReader();
 
-    const records = [];
     let buffer = "";
     const flush = (upTo) => {
       for (const line of buffer.slice(0, upTo).split("\n")) {
-        if (line.trim()) records.push(JSON.parse(line));
+        if (line.trim()) onRecord(JSON.parse(line));
       }
       buffer = buffer.slice(upTo);
     };
@@ -73,7 +101,6 @@ const ScryfallTags = (() => {
       if (lastNewline !== -1) flush(lastNewline + 1);
     }
     flush(buffer.length);
-    return records;
   }
 
   // ---- oracle_id -> [tag labels] index ----
@@ -88,7 +115,7 @@ const ScryfallTags = (() => {
   }
 
   async function loadTagIndex() {
-    const metaRes = await fetch(`${SCRYFALL_API}/bulk-data/oracle_tags`, {
+    const metaRes = await apiFetch("/bulk-data/oracle_tags", {
       headers: { Accept: "application/json" },
     });
     if (!metaRes.ok) throw new Error(`bulk-data meta request failed (${metaRes.status})`);
@@ -107,41 +134,62 @@ const ScryfallTags = (() => {
     }
 
     log(`downloading oracle tags bulk file (${(meta.compressed_size / 1e6).toFixed(1)} MB gzipped)…`);
-    const tags = await fetchJsonl(meta.jsonl_download_uri);
+
+    // Keep only the two things the index needs. A tag record also carries the
+    // full tagging objects (status, timestamps, ids); holding those for every
+    // tagging in the file is what makes this expensive, so they're dropped as
+    // each line arrives.
+    const hierarchy = new Map(); // tag id -> { label, parentIds }
+    const taggedOracleIds = new Map(); // tag id -> [oracle_id]
+    let tagCount = 0;
+    await streamJsonl(meta.jsonl_download_uri, (tag) => {
+      tagCount++;
+      hierarchy.set(tag.id, { label: tag.label, parentIds: tag.parent_ids ?? [] });
+      const oracleIds = [];
+      for (const tagging of tag.taggings ?? []) oracleIds.push(tagging.oracle_id);
+      taggedOracleIds.set(tag.id, oracleIds);
+    });
 
     // A tagging implies the tag itself plus all its ancestors in the tag
     // hierarchy (Tagger shows these as "inherited" tags), so expand each tag
     // to its full label set up front.
-    const byId = new Map(tags.map((t) => [t.id, t]));
+    //
+    // Walked breadth-first rather than by recursive descent so that a cycle in
+    // the hierarchy can't leave a half-computed label set memoized: every tag
+    // gets the labels of everything reachable from it, whatever order the tags
+    // are resolved in.
     const labelSets = new Map(); // tag id -> Set of labels (own + ancestors)
-    function labelsFor(tagId, visiting = new Set()) {
+    function labelsFor(tagId) {
       const known = labelSets.get(tagId);
       if (known) return known;
       const labels = new Set();
-      const tag = byId.get(tagId);
-      if (tag && !visiting.has(tagId)) {
-        visiting.add(tagId);
-        labels.add(tag.label);
-        for (const parentId of tag.parent_ids ?? []) {
-          for (const label of labelsFor(parentId, visiting)) labels.add(label);
-        }
+      const seen = new Set();
+      const queue = [tagId];
+      while (queue.length) {
+        const id = queue.pop();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const node = hierarchy.get(id);
+        if (!node) continue; // parent_id pointing outside the file
+        labels.add(node.label);
+        for (const parentId of node.parentIds) queue.push(parentId);
       }
       labelSets.set(tagId, labels);
       return labels;
     }
 
     const sets = new Map(); // oracle_id -> Set of labels
-    for (const tag of tags) {
-      const labels = labelsFor(tag.id);
-      for (const tagging of tag.taggings ?? []) {
-        let set = sets.get(tagging.oracle_id);
-        if (!set) sets.set(tagging.oracle_id, (set = new Set()));
+    for (const [tagId, oracleIds] of taggedOracleIds) {
+      const labels = labelsFor(tagId);
+      for (const oracleId of oracleIds) {
+        let set = sets.get(oracleId);
+        if (!set) sets.set(oracleId, (set = new Set()));
         for (const label of labels) set.add(label);
       }
     }
     const index = new Map(); // oracle_id -> sorted [tag labels]
     for (const [oracleId, set] of sets) index.set(oracleId, [...set].sort());
-    log(`built oracle tag index: ${tags.length} tags across ${index.size} cards`);
+    log(`built oracle tag index: ${tagCount} tags across ${index.size} cards`);
 
     try {
       await cachePut(INDEX_KEY, {
@@ -160,7 +208,7 @@ const ScryfallTags = (() => {
     const BATCH = 75; // API limit for /cards/collection
     for (let i = 0; i < scryfallIds.length; i += BATCH) {
       const batch = scryfallIds.slice(i, i + BATCH);
-      const res = await fetch(`${SCRYFALL_API}/cards/collection`, {
+      const res = await apiFetch("/cards/collection", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ identifiers: batch.map((id) => ({ id })) }),

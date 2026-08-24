@@ -20,6 +20,7 @@
 
   let tabId = null;
   let applyingPoll = null;
+  let applying = false;
   let getSelectedCount = () => 0;
 
   function stopApplyingPoll() {
@@ -29,9 +30,10 @@
     }
   }
 
-  function syncApplyButton(applying) {
-    applyEl.disabled = applying || getSelectedCount() === 0;
-    applyEl.textContent = applying ? "Applying…" : "Apply Tags";
+  function syncApplyButton(isApplying) {
+    applying = isApplying;
+    applyEl.disabled = isApplying || getSelectedCount() === 0;
+    applyEl.textContent = isApplying ? "Applying…" : "Apply Tags";
   }
 
   function renderSelectedTags(selected, tagCounts, checkboxes, syncSelected) {
@@ -94,8 +96,10 @@
 
     function syncSelected() {
       renderSelectedTags(selected, state.tagCounts, checkboxes, syncSelected);
-      syncApplyButton(false);
-      browser.tabs.sendMessage(tabId, { type: "setSelectedTags", selected: [...selected] });
+      syncApplyButton(applying);
+      browser.tabs
+        .sendMessage(tabId, { type: "setSelectedTags", selected: [...selected] })
+        .catch((err) => console.error("could not sync selection:", err));
     }
 
     tagsEl.replaceChildren(
@@ -166,6 +170,11 @@
     searchEl.focus();
   }
 
+  // sendMessage rejects with "Could not establish connection" when no content
+  // script is running in the tab — that, and only that, is the "not a Moxfield
+  // page" case. Anything else is a real failure and should say what went wrong.
+  const NO_CONTENT_SCRIPT_RE = /could not establish connection|receiving end does not exist/i;
+
   try {
     const state = await loadState();
     if (!state?.deckId) {
@@ -175,7 +184,13 @@
     } else {
       render(state);
     }
-  } catch {
-    showStatus("Open a Moxfield deck page to see its tags.");
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    if (NO_CONTENT_SCRIPT_RE.test(message)) {
+      showStatus("Open a Moxfield deck page to see its tags.");
+    } else {
+      console.error("moxfield-tagger popup failed to load:", err);
+      showStatus(`Something went wrong: ${message}`);
+    }
   }
 })();
