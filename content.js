@@ -10,7 +10,7 @@
 
   const state = {
     authenticated: null, // null = not checked yet, true/false afterwards
-    user: null, // payload from startup/authenticated when logged in
+    user: null, // username only; the rest of the auth payload is not kept
     decks: new Map(), // publicId -> deck JSON
     initializedFor: null, // publicId we've already initialized on
     pending: null, // publicId currently being set up (guards re-entry)
@@ -67,14 +67,30 @@
     return res;
   }
 
+  // How long a negative auth result is trusted before we ask again.
+  const AUTH_RECHECK_MS = 30_000;
+  let lastAuthCheck = 0;
+
   async function checkAuth() {
-    if (state.authenticated !== null) return state.authenticated;
+    // Only a positive result is cached for good. Caching "false" would lock
+    // the extension out for the life of the tab if the user logs in
+    // afterwards, but re-checking is a POST, so back it off rather than
+    // firing one on every SPA navigation.
+    if (state.authenticated) return true;
+    if (state.authenticated === false && Date.now() - lastAuthCheck < AUTH_RECHECK_MS) {
+      return false;
+    }
+    lastAuthCheck = Date.now();
     try {
       const res = await startupAuthenticated();
       state.authenticated = res.ok;
       if (res.ok) {
-        state.user = await res.json().catch(() => null);
-        log("logged in", state.user?.userName ?? "", state.user);
+        // Keep the username and nothing else: the startup payload is the same
+        // object the access token is read out of, so holding or logging it
+        // would put a live bearer JWT in memory and in the page's console.
+        const payload = await res.json().catch(() => null);
+        state.user = payload?.userName ?? null;
+        log("logged in", state.user ?? "");
       } else {
         log(`not logged in (startup/authenticated returned ${res.status})`);
       }
@@ -88,21 +104,50 @@
   // ---- access token (Bearer JWT, ~15 min lifetime, for write requests) ----
   let accessToken = null; // { token, expiresAt }
 
-  function findJwt(value) {
-    if (typeof value === "string") {
-      return /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(value) ? value : null;
+  const JWT_RE = /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/;
+  // Field names that hold the short-lived access token we want.
+  const ACCESS_TOKEN_KEYS = ["access_token", "accessToken"];
+  // Never lift a bearer token out of one of these: sending a long-lived
+  // refresh or identity token as an Authorization header is far worse than
+  // failing the write and asking the user to reload.
+  const NON_ACCESS_KEY_RE = /refresh|identity|id_?token/i;
+
+  const isJwt = (value) => typeof value === "string" && JWT_RE.test(value);
+
+  // Preferred path: a field actually named like an access token, at any depth.
+  function findTokenByKey(value, seen) {
+    if (!value || typeof value !== "object" || seen.has(value)) return null;
+    seen.add(value);
+    for (const key of ACCESS_TOKEN_KEYS) {
+      if (isJwt(value[key])) return value[key];
     }
-    if (value && typeof value === "object") {
-      for (const inner of Object.values(value)) {
-        const token = findJwt(inner);
-        if (token) return token;
-      }
+    for (const inner of Object.values(value)) {
+      const token = findTokenByKey(inner, seen);
+      if (token) return token;
     }
     return null;
   }
 
+  // Fallback for a renamed field: any JWT-shaped string that isn't sitting
+  // under a refresh/identity key.
+  function findAnyJwt(value, seen) {
+    if (!value || typeof value !== "object" || seen.has(value)) return null;
+    seen.add(value);
+    for (const [key, inner] of Object.entries(value)) {
+      if (NON_ACCESS_KEY_RE.test(key)) continue;
+      if (isJwt(inner)) return inner;
+      const token = findAnyJwt(inner, seen);
+      if (token) return token;
+    }
+    return null;
+  }
+
+  function findAccessToken(payload) {
+    return findTokenByKey(payload, new Set()) ?? findAnyJwt(payload, new Set());
+  }
+
   function captureAccessToken(startupResponse) {
-    const token = findJwt(startupResponse);
+    const token = findAccessToken(startupResponse);
     if (!token) return;
     let expiresAt = 0;
     try {
@@ -164,6 +209,7 @@
       return;
     }
     if (state.initializedFor === deckId || state.pending === deckId) return;
+    if (state.applying) return; // see teardown(): the running apply owns state
 
     state.pending = deckId;
     try {
@@ -221,10 +267,7 @@
       state.cards = cards;
       state.tagCounts = countTags(cards);
       initWriteState(deck);
-      log(`scryfall tags loaded for ${cards.length} cards:`, cards);
-      log(
-        `tag frequencies:\n`, state.tagCounts
-      );
+      log(`scryfall tags loaded for ${cards.length} cards, ${state.tagCounts.length} distinct tags`);
     } catch (err) {
       log("failed to load scryfall tags:", err);
     }
@@ -232,6 +275,13 @@
   }
 
   function teardown() {
+    // A run in flight owns state.write and state.cards; clearing them mid-loop
+    // would throw and abandon the rest of the deck. applyTags re-syncs to the
+    // current URL when it finishes.
+    if (state.applying) {
+      log("apply in progress; deferring teardown");
+      return;
+    }
     state.initializedFor = null;
     state.cards = [];
     state.tagCounts = [];
@@ -375,6 +425,8 @@
       return { ...summary, error: String(err?.message ?? err) };
     } finally {
       state.applying = false;
+      // Navigation was deferred while the run held state.write; catch up now.
+      if (state.initializedFor !== currentDeckId()) onUrlChange();
     }
   }
 
@@ -383,6 +435,7 @@
   // "not allowed to define cross-origin object as property" if a rejected
   // Promise carries a non-cloneable Error across this boundary.
   browser.runtime.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== "object") return;
     if (msg.type === "getState") {
       return Promise.resolve({
         deckId: state.initializedFor,
@@ -393,13 +446,21 @@
       });
     }
     if (msg.type === "setSelectedTags") {
+      if (!Array.isArray(msg.selected)) return Promise.resolve({ ok: false });
       state.selectedTags = new Set(msg.selected);
       log("selected tags:", [...state.selectedTags]);
       return Promise.resolve({ ok: true });
     }
     if (msg.type === "applyTags") {
+      if (!Array.isArray(msg.selected)) {
+        return Promise.resolve({ ok: false, updated: 0, skipped: 0, failed: 0, error: "bad request" });
+      }
       return applyTags(msg.selected).then((summary) => {
-        if (!summary.error) {
+        // Only reload when something actually changed. The reload fires the
+        // page's beforeunload handler, so Moxfield still guards genuinely
+        // unsaved editor changes, but there's no reason to risk it for a run
+        // that wrote nothing.
+        if (!summary.error && summary.updated > 0) {
           setTimeout(() => location.reload(), 800);
         }
         return {

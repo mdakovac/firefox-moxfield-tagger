@@ -1,8 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Moxfield Tagger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tagging tools for Moxfield deck pages.",
+  "permissions": [
+    "storage",
+    "unlimitedStorage"
+  ],
   "browser_specific_settings": {
     "gecko": {
       "id": "moxfield-tagger@local",
