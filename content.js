@@ -523,13 +523,20 @@
       if (!Array.isArray(msg.selected)) {
         return Promise.resolve({ ok: false, updated: 0, skipped: 0, failed: 0, error: "bad request" });
       }
+      // A run outlives SPA navigation (see teardown), so remember which deck
+      // it was for. Reloading whatever deck the user has since opened would be
+      // unrelated collateral, and could interrupt its initialization.
+      const startedOn = currentDeckId();
       return applyTags(msg.selected).then((summary) => {
         // Reload whenever anything was written — including a run that aborted
         // part-way, since the page is showing stale tags either way. The reload
         // fires the page's beforeunload handler, so Moxfield still guards
         // genuinely unsaved editor changes; a run that wrote nothing skips it.
-        if (summary.updated > 0) {
-          setTimeout(() => location.reload(), 800);
+        if (summary.updated > 0 && currentDeckId() === startedOn) {
+          setTimeout(() => {
+            // Re-check: the user can still navigate during the delay.
+            if (currentDeckId() === startedOn) location.reload();
+          }, 800);
         }
         return {
           ok: !summary.error,

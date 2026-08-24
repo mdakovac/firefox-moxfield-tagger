@@ -10,13 +10,42 @@ const ScryfallTags = (() => {
   const SCRYFALL_API = "https://api.scryfall.com";
   // Bump the suffix when the index format changes so stale caches are rebuilt.
   const INDEX_KEY = "oracleTagIndex@4";
-  // Scryfall's API guidelines ask for 50-100ms between requests.
+  // Scryfall's API guidelines ask for 50-100ms between requests; enforced for
+  // every API-host call by apiFetch below.
   const REQUEST_SPACING_MS = 100;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function log(...args) {
     console.log("[moxfield-tagger:scryfall]", ...args);
+  }
+
+  // ---- request scheduler ----
+  // Every api.scryfall.com request goes through here, so the spacing holds no
+  // matter how the callers are composed: getTags() deliberately runs the index
+  // load and the id resolution concurrently, which would otherwise put the
+  // bulk-metadata GET and the first /cards/collection POST on the wire at the
+  // same instant. Requests are issued one at a time, REQUEST_SPACING_MS apart.
+  //
+  // The bulk file itself is not routed through here: it is served from a
+  // separate CDN host, not the rate-limited API host, and serialising a ~17 MB
+  // download behind this queue would stall every other request.
+  let apiQueue = Promise.resolve();
+  let lastRequestAt = 0;
+
+  function apiFetch(path, init) {
+    const result = apiQueue.then(async () => {
+      const wait = REQUEST_SPACING_MS - (Date.now() - lastRequestAt);
+      if (wait > 0) await sleep(wait);
+      lastRequestAt = Date.now();
+      return fetch(`${SCRYFALL_API}${path}`, init);
+    });
+    // Keep the queue moving when a request fails; the caller still sees it.
+    apiQueue = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
   }
 
   // ---- cache (so the ~17 MB bulk file is downloaded once a day) ----
@@ -86,7 +115,7 @@ const ScryfallTags = (() => {
   }
 
   async function loadTagIndex() {
-    const metaRes = await fetch(`${SCRYFALL_API}/bulk-data/oracle_tags`, {
+    const metaRes = await apiFetch("/bulk-data/oracle_tags", {
       headers: { Accept: "application/json" },
     });
     if (!metaRes.ok) throw new Error(`bulk-data meta request failed (${metaRes.status})`);
@@ -178,9 +207,8 @@ const ScryfallTags = (() => {
     const result = new Map();
     const BATCH = 75; // API limit for /cards/collection
     for (let i = 0; i < scryfallIds.length; i += BATCH) {
-      if (i > 0) await sleep(REQUEST_SPACING_MS);
       const batch = scryfallIds.slice(i, i + BATCH);
-      const res = await fetch(`${SCRYFALL_API}/cards/collection`, {
+      const res = await apiFetch("/cards/collection", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ identifiers: batch.map((id) => ({ id })) }),
